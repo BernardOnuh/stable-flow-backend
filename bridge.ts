@@ -304,7 +304,7 @@ async function fundSmartWalletWithETH(
   // Wait for transaction
   await publicClient.waitForTransactionReceipt({ hash });
 
-  console.log(`   ✅ Sent ${formatUnits(amount, 18)} ETH to smart wallet`);
+  console.log(`✅ Sent ${formatUnits(amount, 18)} ETH to smart wallet`);
 }
 
 /**
