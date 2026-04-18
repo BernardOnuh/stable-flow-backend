@@ -1,481 +1,344 @@
 import { CdpClient } from "@coinbase/cdp-sdk";
-import { createPublicClient, http, parseUnits, encodeFunctionData, formatUnits, parseEther, createWalletClient } from "viem";
-import { baseSepolia, sepolia } from "viem/chains";
-import { privateKeyToAccount } from "viem/accounts";
+import { parseEther, isAddress } from "viem";
 import dotenv from "dotenv";
 
 dotenv.config();
 
+// ============================================
+// SECURITY CONFIGURATION
+// ============================================
 
-const USDT_ADDRESSES = {
-  sepolia: "0x21dE5De8A2b4A7c0f8198ac240403Af7d093179e",
-  "base-sepolia": "0xFB8C2026977FB4f580D0021D76843325e724Fa04",
+const SECURITY_CONFIG = {
+  MAX_TRANSACTION_VALUE: parseEther("1"), // Maximum 1 ETH per transaction
+  TRANSACTION_TIMEOUT: 300000, // 5 minutes timeout
+  MAX_RETRIES: 3,
+  RETRY_DELAY: 2000, // 2 seconds
+  ALLOWED_NETWORKS: ["base-sepolia", "base-mainnet"] as const,
+  RATE_LIMIT: {
+    maxRequests: 10,
+    windowMs: 60000, // 1 minute
+  },
 };
 
-const CHAIN_EIDS = {
-  sepolia: 40161,
-  "base-sepolia": 40245,
-};
+// ============================================
+// VALIDATION FUNCTIONS
+// ============================================
 
-const CHAIN_CONFIG = {
-  "base-sepolia": baseSepolia,
-  sepolia: sepolia,
-};
+class SecurityValidator {
+  private static rateLimitTracker = new Map<string, { count: number; resetTime: number }>();
 
-// Funding wallet configuration (from .env)
-const FUNDING_WALLET_PRIVATE_KEY = process.env.CUSTOMWALLET 
-  ? `0x${process.env.CUSTOMWALLET}` 
-  : "";
+  /**
+   * Validate environment variables
+   */
+  static validateEnvironment(): void {
+    const requiredVars = ["CDP_API_KEY", "CDP_PRIVATE_KEY"];
+    const missing = requiredVars.filter((varName) => !process.env[varName]);
 
-// Configurable destination wallet (from .env)
-const DEFAULT_DESTINATION_WALLET = process.env.DESTINATION_WALLET || "0x22890dfAeD0667723fcD66e34FfB853b4F81f6bd";
-
-// Configurable bridge parameters (from .env)
-const SOURCE_CHAIN = (process.env.SOURCE_CHAIN || "base-sepolia") as NetworkType;
-const DESTINATION_CHAIN = (process.env.DESTINATION_CHAIN || "sepolia") as NetworkType;
-const BRIDGE_AMOUNT = process.env.BRIDGE_AMOUNT || "10";
-
-// Type for supported networks
-type NetworkType = "sepolia" | "base-sepolia";
-
-// ABIs
-const BRIDGE_ABI = [
-  {
-    inputs: [
-      { name: "_dstEid", type: "uint32" },
-      { name: "_recipient", type: "address" },
-      { name: "_amount", type: "uint256" },
-      { name: "_extraOptions", type: "bytes" },
-    ],
-    name: "bridge",
-    outputs: [],
-    stateMutability: "payable",
-    type: "function",
-  },
-  {
-    inputs: [
-      { name: "_dstEid", type: "uint32" },
-      { name: "_amount", type: "uint256" },
-      { name: "_extraOptions", type: "bytes" },
-    ],
-    name: "getCompleteQuote",
-    outputs: [
-      { name: "lzFee", type: "uint256" },
-      { name: "lpFee", type: "uint256" },
-      { name: "protocolFee", type: "uint256" },
-      { name: "totalBridgeFee", type: "uint256" },
-      { name: "amountToReceive", type: "uint256" },
-    ],
-    stateMutability: "view",
-    type: "function",
-  },
-] as const;
-
-const ERC20_ABI = [
-  {
-    inputs: [
-      { name: "spender", type: "address" },
-      { name: "amount", type: "uint256" },
-    ],
-    name: "approve",
-    outputs: [{ name: "", type: "bool" }],
-    stateMutability: "nonpayable",
-    type: "function",
-  },
-  {
-    inputs: [{ name: "account", type: "address" }],
-    name: "balanceOf",
-    outputs: [{ name: "", type: "uint256" }],
-    stateMutability: "view",
-    type: "function",
-  },
-  {
-    inputs: [
-      { name: "recipient", type: "address" },
-      { name: "amount", type: "uint256" },
-    ],
-    name: "transfer",
-    outputs: [{ name: "", type: "bool" }],
-    stateMutability: "nonpayable",
-    type: "function",
-  },
-] as const;
-
-interface BridgeRequest {
-  sourceChain: NetworkType;
-  destinationChain: NetworkType;
-  amountUSDT: string;
-  destinationWallet: string;
-}
-
-interface SmartWalletInfo {
-  owner: any;
-  smartAccount: any;
-  ownerAddress: string;
-  smartWalletAddress: string;
-  depositAddress: string;
-}
-
-/**
- * Main function: Creates smart wallet and bridges USDT to destination
- * Automatically funds the smart wallet with ETH from a pre-funded owner wallet
- */
-async function createSmartWalletAndBridge(request: BridgeRequest): Promise<void> {
-  const cdp = new CdpClient();
-
-  console.log("🚀 Starting Bridge Request (Auto-Funded)");
-  console.log("=".repeat(60));
-  console.log(`Source Chain: ${request.sourceChain}`);
-  console.log(`Destination Chain: ${request.destinationChain}`);
-  console.log(`Amount: ${request.amountUSDT} USDT`);
-  console.log(`Final Recipient: ${request.destinationWallet}`);
-  console.log("=".repeat(60));
-  console.log();
-
-  // STEP 1: Create Smart Wallet
-  console.log("📝 STEP 1: Creating Smart Wallet...");
-  const walletInfo = await createSmartWallet(cdp);
-  console.log(`   ✅ Owner Account: ${walletInfo.ownerAddress}`);
-  console.log(`   ✅ Smart Wallet: ${walletInfo.smartWalletAddress}`);
-  console.log(`   💰 Deposit Address: ${walletInfo.depositAddress}`);
-  console.log();
-
-  // STEP 2: Get quote first to know how much ETH is needed
-  console.log("💰 STEP 2: Calculating fees...");
-  const amount = parseUnits(request.amountUSDT, 6);
-  const quote = await getBridgeQuote(
-    request.sourceChain,
-    request.destinationChain,
-    amount
-  );
-  console.log(`   LayerZero fee: ${formatUnits(quote.lzFee, 18)} ETH`);
-  console.log(`   LP fee: ${formatUnits(quote.lpFee, 6)} USDT`);
-  console.log(`   Protocol fee: ${formatUnits(quote.protocolFee, 6)} USDT`);
-  console.log(`   Recipient receives: ${formatUnits(quote.amountToReceive, 6)} USDT`);
-  console.log();
-
-  // STEP 3: Auto-fund smart wallet with ETH immediately
-  console.log("💸 STEP 3: Auto-funding smart wallet with ETH...");
-  const requiredETH = (quote.lzFee * 120n) / 100n; // 20% buffer
-  
-  console.log(`   Required ETH: ${formatUnits(requiredETH, 18)} ETH`);
-  console.log(`   🔄 Funding from custom wallet...`);
-  
-  await fundSmartWalletWithETH(
-    walletInfo.depositAddress,
-    request.sourceChain,
-    requiredETH
-  );
-  
-  console.log(`   ✅ Smart wallet funded with ETH`);
-  console.log();
-
-  // STEP 4: Wait for USDT deposit
-  console.log("⏳ STEP 4: Waiting for USDT deposit...");
-  console.log(`   Send ${request.amountUSDT} USDT to: ${walletInfo.depositAddress}`);
-  console.log(`   on ${request.sourceChain}`);
-  console.log();
-  console.log("   ⛽ Transaction gas will be sponsored by Coinbase Paymaster!");
-  console.log();
-  console.log("   💡 FOR TESTING:");
-  console.log(`   SMART_WALLET=${walletInfo.depositAddress} npx hardhat run scripts/send-usdt-to-smart-wallet.js --network ${request.sourceChain}`);
-  console.log();
-
-  // Wait for USDT
-  await waitForUSDTDeposit(
-    walletInfo.depositAddress,
-    request.sourceChain,
-    amount
-  );
-  console.log(`   ✅ Received ${request.amountUSDT} USDT`);
-  console.log();
-
-  // STEP 5: Execute bridge transaction with paymaster
-  console.log("🌉 STEP 5: Executing bridge transaction...");
-  console.log("   ⛽ Using Coinbase Paymaster for transaction gas");
-  const txHash = await executeBridgeWithPaymaster(
-    cdp,
-    walletInfo,
-    request,
-    amount,
-    quote.lzFee
-  );
-  console.log(`   ✅ Transaction Hash: ${txHash}`);
-  console.log();
-
-  // STEP 6: Track cross-chain delivery
-  console.log("🎉 BRIDGE REQUEST COMPLETED!");
-  console.log("=".repeat(60));
-  console.log(`Smart Wallet: ${walletInfo.smartWalletAddress}`);
-  console.log(`Transaction: https://${request.sourceChain === "base-sepolia" ? "sepolia.basescan.org" : "sepolia.etherscan.io"}/tx/${txHash}`);
-  console.log(`LayerZero Tracker: https://testnet.layerzeroscan.com/tx/${txHash}`);
-  console.log();
-  console.log(`💰 ${formatUnits(quote.amountToReceive, 6)} USDT will arrive at:`);
-  console.log(`   ${request.destinationWallet}`);
-  console.log(`   on ${request.destinationChain}`);
-  console.log();
-  console.log("⏰ Cross-chain delivery: 1-3 minutes");
-  console.log("=".repeat(60));
-}
-
-/**
- * Creates a smart wallet (owner + smart account)
- */
-async function createSmartWallet(cdp: CdpClient): Promise<SmartWalletInfo> {
-  const owner = await cdp.evm.createAccount();
-  const smartAccount = await cdp.evm.createSmartAccount({
-    owner,
-  });
-
-  return {
-    owner,
-    smartAccount,
-    ownerAddress: owner.address,
-    smartWalletAddress: smartAccount.address,
-    depositAddress: smartAccount.address,
-  };
-}
-
-/**
- * Check ETH balance of an address
- */
-async function checkETHBalance(
-  address: string,
-  chain: NetworkType
-): Promise<bigint> {
-  const publicClient = createPublicClient({
-    chain: CHAIN_CONFIG[chain],
-    transport: http(),
-  });
-
-  return await publicClient.getBalance({
-    address: address as `0x${string}`,
-  });
-}
-
-/**
- * Fund smart wallet with ETH from the funding wallet
- */
-async function fundSmartWalletWithETH(
-  smartWalletAddress: string,
-  chain: NetworkType,
-  amount: bigint
-): Promise<void> {
-  if (!FUNDING_WALLET_PRIVATE_KEY) {
-    throw new Error("CUSTOMWALLET not set in .env");
-  }
-
-  const account = privateKeyToAccount(FUNDING_WALLET_PRIVATE_KEY as `0x${string}`);
-  
-  const walletClient = createWalletClient({
-    account,
-    chain: CHAIN_CONFIG[chain],
-    transport: http(),
-  });
-
-  const publicClient = createPublicClient({
-    chain: CHAIN_CONFIG[chain],
-    transport: http(),
-  });
-
-  // Check funding wallet balance
-  const fundingBalance = await publicClient.getBalance({
-    address: account.address,
-  });
-
-  console.log(`   Funding wallet: ${account.address}`);
-  console.log(`   Funding wallet balance: ${formatUnits(fundingBalance, 18)} ETH`);
-
-  if (fundingBalance < amount) {
-    throw new Error(
-      `Insufficient funds in funding wallet. Need ${formatUnits(amount, 18)} ETH, have ${formatUnits(fundingBalance, 18)} ETH`
-    );
-  }
-
-  // Send ETH to smart wallet
-  const hash = await walletClient.sendTransaction({
-    to: smartWalletAddress as `0x${string}`,
-    value: amount,
-  });
-
-  console.log(`   Funding tx hash: ${hash}`);
-  console.log(`   Waiting for confirmation...`);
-
-  // Wait for transaction
-  await publicClient.waitForTransactionReceipt({ hash });
-
-  console.log(`✅ Sent ${formatUnits(amount, 18)} ETH to smart wallet`);
-}
-
-/**
- * Waits for USDT to be deposited to the smart wallet
- */
-async function waitForUSDTDeposit(
-  walletAddress: string,
-  chain: NetworkType,
-  expectedAmount: bigint
-): Promise<void> {
-  const publicClient = createPublicClient({
-    chain: CHAIN_CONFIG[chain],
-    transport: http(),
-  });
-
-  const usdtAddress = USDT_ADDRESSES[chain];
-  let attempts = 0;
-  const maxAttempts = 120; // 10 minutes
-
-  while (attempts < maxAttempts) {
-    try {
-      const balance = await publicClient.readContract({
-        address: usdtAddress as `0x${string}`,
-        abi: ERC20_ABI,
-        functionName: "balanceOf",
-        args: [walletAddress as `0x${string}`],
-      }) as bigint;
-
-      if (balance >= expectedAmount) {
-        return;
-      }
-
-      if (attempts % 6 === 0) {
-        console.log(`   Current USDT: ${formatUnits(balance, 6)} / ${formatUnits(expectedAmount, 6)} USDT (waiting...)`);
-      }
-    } catch (error) {
-      console.error("   Error checking USDT balance:", error);
+    if (missing.length > 0) {
+      throw new Error(`Missing required environment variables: ${missing.join(", ")}`);
     }
 
-    await new Promise((resolve) => setTimeout(resolve, 5000));
-    attempts++;
+    // Validate API key format (basic check)
+    if (process.env.CDP_API_KEY && process.env.CDP_API_KEY.length < 32) {
+      throw new Error("CDP_API_KEY appears to be invalid (too short)");
+    }
   }
 
-  throw new Error("Timeout waiting for USDT deposit");
-}
-
-/**
- * Gets bridge fee quote
- */
-async function getBridgeQuote(
-  sourceChain: NetworkType,
-  destChain: NetworkType,
-  amount: bigint
-) {
-  const publicClient = createPublicClient({
-    chain: CHAIN_CONFIG[sourceChain],
-    transport: http(),
-  });
-
-  const bridgeAddress = BRIDGE_ADDRESSES[sourceChain];
-  const destEid = CHAIN_EIDS[destChain];
-
-  const quote = await publicClient.readContract({
-    address: bridgeAddress as `0x${string}`,
-    abi: BRIDGE_ABI,
-    functionName: "getCompleteQuote",
-    args: [destEid, amount, "0x" as `0x${string}`],
-  }) as [bigint, bigint, bigint, bigint, bigint];
-
-  const [lzFee, lpFee, protocolFee, totalBridgeFee, amountToReceive] = quote;
-
-  return {
-    lzFee,
-    lpFee,
-    protocolFee,
-    totalBridgeFee,
-    amountToReceive,
-  };
-}
-
-/**
- * Executes the bridge transaction WITH PAYMASTER for gas sponsorship
- */
-async function executeBridgeWithPaymaster(
-  cdp: CdpClient,
-  walletInfo: SmartWalletInfo,
-  request: BridgeRequest,
-  amount: bigint,
-  lzFee: bigint
-): Promise<string> {
-  const bridgeAddress = BRIDGE_ADDRESSES[request.sourceChain];
-  const usdtAddress = USDT_ADDRESSES[request.sourceChain];
-  const destEid = CHAIN_EIDS[request.destinationChain];
-
-  // Encode approve transaction
-  const approveData = encodeFunctionData({
-    abi: ERC20_ABI,
-    functionName: "approve",
-    args: [bridgeAddress as `0x${string}`, amount],
-  });
-
-  // Encode bridge transaction
-  const bridgeData = encodeFunctionData({
-    abi: BRIDGE_ABI,
-    functionName: "bridge",
-    args: [destEid, request.destinationWallet as `0x${string}`, amount, "0x" as `0x${string}`],
-  });
-
-  console.log("   Preparing user operation with paymaster...");
-  console.log(`   Approve: ${formatUnits(amount, 6)} USDT`);
-  console.log(`   Bridge with: ${formatUnits(lzFee, 18)} ETH for LayerZero`);
-  console.log(`   Gas fees: Sponsored by Coinbase Paymaster ✨`);
-  
-  // Execute batch transaction
-  const result = await cdp.evm.sendUserOperation({
-    smartAccount: walletInfo.smartAccount,
-    network: request.sourceChain as any,
-    calls: [
-      {
-        to: usdtAddress as `0x${string}`,
-        value: 0n,
-        data: approveData,
-      },
-      {
-        to: bridgeAddress as `0x${string}`,
-        value: lzFee,
-        data: bridgeData,
-      },
-    ],
-  });
-
-  console.log(`   UserOp Hash: ${result.userOpHash}`);
-
-  // Wait for confirmation
-  console.log("   Waiting for confirmation...");
-  const userOperation = await cdp.evm.waitForUserOperation({
-    smartAccountAddress: walletInfo.smartAccount.address,
-    userOpHash: result.userOpHash,
-  });
-
-  if (userOperation.status !== "complete") {
-    throw new Error(`Transaction failed: ${userOperation.status}`);
+  /**
+   * Validate address format
+   */
+  static validateAddress(address: string, label: string): void {
+    if (!address) {
+      throw new Error(`${label} address is required`);
+    }
+    if (!isAddress(address)) {
+      throw new Error(`${label} address is invalid: ${address}`);
+    }
+    // Check for zero address
+    if (address.toLowerCase() === "0x0000000000000000000000000000000000000000") {
+      console.warn(`Warning: ${label} is the zero address`);
+    }
   }
 
-  return userOperation.transactionHash;
+  /**
+   * Validate transaction value
+   */
+  static validateTransactionValue(value: bigint): void {
+    if (value < 0n) {
+      throw new Error("Transaction value cannot be negative");
+    }
+    if (value > SECURITY_CONFIG.MAX_TRANSACTION_VALUE) {
+      throw new Error(
+        `Transaction value ${value} exceeds maximum allowed: ${SECURITY_CONFIG.MAX_TRANSACTION_VALUE}`
+      );
+    }
+  }
+
+  /**
+   * Validate network
+   */
+  static validateNetwork(network: string): void {
+    if (!SECURITY_CONFIG.ALLOWED_NETWORKS.includes(network as any)) {
+      throw new Error(
+        `Network ${network} not allowed. Allowed networks: ${SECURITY_CONFIG.ALLOWED_NETWORKS.join(", ")}`
+      );
+    }
+  }
+
+  /**
+   * Rate limiting check
+   */
+  static checkRateLimit(identifier: string): void {
+    const now = Date.now();
+    const tracker = this.rateLimitTracker.get(identifier);
+
+    if (!tracker || now > tracker.resetTime) {
+      // Reset or initialize
+      this.rateLimitTracker.set(identifier, {
+        count: 1,
+        resetTime: now + SECURITY_CONFIG.RATE_LIMIT.windowMs,
+      });
+      return;
+    }
+
+    if (tracker.count >= SECURITY_CONFIG.RATE_LIMIT.maxRequests) {
+      const waitTime = Math.ceil((tracker.resetTime - now) / 1000);
+      throw new Error(`Rate limit exceeded. Please wait ${waitTime} seconds`);
+    }
+
+    tracker.count++;
+  }
+
+  /**
+   * Sanitize transaction data
+   */
+  static sanitizeData(data: string): string {
+    if (!data.startsWith("0x")) {
+      throw new Error("Transaction data must start with 0x");
+    }
+    // Remove any whitespace
+    return data.trim();
+  }
 }
 
-// ============================================================================
-// MAIN EXECUTION - Uses environment variables
-// ============================================================================
+// ============================================
+// RETRY LOGIC WITH EXPONENTIAL BACKOFF
+// ============================================
 
-const bridgeRequest: BridgeRequest = {
-  sourceChain: SOURCE_CHAIN,
-  destinationChain: DESTINATION_CHAIN,
-  amountUSDT: BRIDGE_AMOUNT,
-  destinationWallet: DEFAULT_DESTINATION_WALLET,
-};
+async function withRetry<T>(
+  operation: () => Promise<T>,
+  operationName: string,
+  maxRetries: number = SECURITY_CONFIG.MAX_RETRIES
+): Promise<T> {
+  let lastError: Error | null = null;
 
-console.log("\n📋 Configuration loaded from .env:");
-console.log(`   Source Chain: ${SOURCE_CHAIN}`);
-console.log(`   Destination Chain: ${DESTINATION_CHAIN}`);
-console.log(`   Amount: ${BRIDGE_AMOUNT} USDT`);
-console.log(`   Destination Wallet: ${DEFAULT_DESTINATION_WALLET}`);
-console.log();
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      console.log(`[${operationName}] Attempt ${attempt}/${maxRetries}`);
+      return await operation();
+    } catch (error) {
+      lastError = error as Error;
+      console.error(`[${operationName}] Attempt ${attempt} failed:`, error);
 
-createSmartWalletAndBridge(bridgeRequest)
-  .then(() => {
-    console.log("\n✅ Process completed successfully!");
-    process.exit(0);
-  })
-  .catch((error) => {
-    console.error("\n❌ Error:", error);
+      if (attempt < maxRetries) {
+        const delay = SECURITY_CONFIG.RETRY_DELAY * Math.pow(2, attempt - 1);
+        console.log(`Retrying in ${delay}ms...`);
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+    }
+  }
+
+  throw new Error(
+    `${operationName} failed after ${maxRetries} attempts: ${lastError?.message}`
+  );
+}
+
+// ============================================
+// SECURE TRANSACTION BUILDER
+// ============================================
+
+interface SecureCall {
+  to: string;
+  value: bigint;
+  data: string;
+}
+
+class SecureTransactionBuilder {
+  private calls: SecureCall[] = [];
+
+  addCall(to: string, value: bigint, data: string): this {
+    // Validate each parameter
+    SecurityValidator.validateAddress(to, "Recipient");
+    SecurityValidator.validateTransactionValue(value);
+    const sanitizedData = SecurityValidator.sanitizeData(data);
+
+    this.calls.push({ to, value, data: sanitizedData });
+    return this;
+  }
+
+  build(): SecureCall[] {
+    if (this.calls.length === 0) {
+      throw new Error("No calls added to transaction");
+    }
+    return [...this.calls]; // Return copy to prevent modification
+  }
+
+  reset(): void {
+    this.calls = [];
+  }
+}
+
+// ============================================
+// MAIN SECURE EXECUTION
+// ============================================
+
+async function executeSecureTransaction() {
+  console.log("🔒 Starting secure transaction execution...\n");
+
+  try {
+    // Step 1: Validate environment
+    console.log("✅ Step 1: Validating environment...");
+    SecurityValidator.validateEnvironment();
+    console.log("   Environment validated successfully\n");
+
+    // Step 2: Initialize CDP client
+    console.log("✅ Step 2: Initializing CDP client...");
+    const cdp = new CdpClient();
+    console.log("   CDP client initialized\n");
+
+    // Step 3: Create owner account with retry
+    console.log("✅ Step 3: Creating owner account...");
+    const owner = await withRetry(
+      async () => await cdp.evm.createAccount({}),
+      "Create Owner Account"
+    );
+    console.log("   Created owner account:", owner.address);
+    SecurityValidator.validateAddress(owner.address, "Owner");
+    console.log("   Owner address validated\n");
+
+    // Step 4: Create smart account with retry
+    console.log("✅ Step 4: Creating smart account...");
+    const smartAccount = await withRetry(
+      async () => await cdp.evm.createSmartAccount({ owner }),
+      "Create Smart Account"
+    );
+    console.log("   Created smart account:", smartAccount.address);
+    SecurityValidator.validateAddress(smartAccount.address, "Smart Account");
+    console.log("   Smart account address validated\n");
+
+    // Step 5: Build secure transaction
+    console.log("✅ Step 5: Building secure transaction...");
+    const network = "base-sepolia";
+    SecurityValidator.validateNetwork(network);
+
+    const txBuilder = new SecureTransactionBuilder();
+    txBuilder.addCall(
+      "0x0000000000000000000000000000000000000000", // Recipient address
+      parseEther("0"), // Value in ETH
+      "0x" // Transaction data
+    );
+
+    const calls = txBuilder.build();
+    console.log(`   Built ${calls.length} secure call(s)\n`);
+
+    // Step 6: Rate limiting check
+    console.log("✅ Step 6: Checking rate limits...");
+    SecurityValidator.checkRateLimit(smartAccount.address);
+    console.log("   Rate limit check passed\n");
+
+    // Step 7: Send user operation with timeout
+    console.log("✅ Step 7: Sending user operation...");
+    const sendPromise = withRetry(
+      async () =>
+        await cdp.evm.sendUserOperation({
+          smartAccount,
+          network,
+          calls,
+        }),
+      "Send User Operation"
+    );
+
+    // Add timeout protection
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(
+        () => reject(new Error("Transaction timeout")),
+        SECURITY_CONFIG.TRANSACTION_TIMEOUT
+      )
+    );
+
+    const result = await Promise.race([sendPromise, timeoutPromise]);
+    console.log("   User operation status:", result.status);
+    console.log("   User operation hash:", result.userOpHash, "\n");
+
+    // Step 8: Wait for confirmation
+    console.log("✅ Step 8: Waiting for confirmation...");
+    const userOperation = await withRetry(
+      async () =>
+        await cdp.evm.waitForUserOperation({
+          smartAccountAddress: smartAccount.address,
+          userOpHash: result.userOpHash,
+        }),
+      "Wait for User Operation"
+    );
+
+    // Step 9: Verify final status
+    console.log("✅ Step 9: Verifying transaction status...");
+    if (userOperation.status === "complete") {
+      const explorerLink = `https://sepolia.basescan.org/tx/${userOperation.transactionHash}`;
+      console.log("   ✅ Transaction confirmed successfully!");
+      console.log("   Block explorer link:", explorerLink);
+      console.log("   Transaction hash:", userOperation.transactionHash);
+
+      return {
+        success: true,
+        transactionHash: userOperation.transactionHash,
+        explorerLink,
+        smartAccountAddress: smartAccount.address,
+        ownerAddress: owner.address,
+      };
+    } else {
+      throw new Error(`Transaction failed with status: ${userOperation.status}`);
+    }
+  } catch (error) {
+    console.error("\n❌ Transaction failed with error:");
+    console.error(error);
+
+    // Log error details for debugging (but sanitize sensitive info)
+    if (error instanceof Error) {
+      console.error("Error name:", error.name);
+      console.error("Error message:", error.message);
+      // Don't log stack trace in production
+      if (process.env.NODE_ENV !== "production") {
+        console.error("Stack trace:", error.stack);
+      }
+    }
+
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : "Unknown error",
+    };
+  } finally {
+    console.log("\n🔒 Transaction execution completed");
+  }
+}
+
+// ============================================
+// EXECUTION WITH ERROR HANDLING
+// ============================================
+
+(async () => {
+  try {
+    const result = await executeSecureTransaction();
+    
+    if (result.success) {
+      console.log("\n✨ Transaction successful!");
+      process.exit(0);
+    } else {
+      console.log("\n💥 Transaction failed");
+      process.exit(1);
+    }
+  } catch (error) {
+    console.error("\n💥 Fatal error:", error);
     process.exit(1);
-  });
+  }
+})();
