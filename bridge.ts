@@ -10,7 +10,7 @@ dotenv.config();
 
 const SECURITY_CONFIG = {
   MAX_TRANSACTION_VALUE: parseEther("1"), // Maximum 1 ETH per transaction
-  TRANSACTION_TIMEOUT: 300000, // 5 minutes timeout
+  TRANSACTION_TIMEOUT: 200000, // 5 minutes timeout
   MAX_RETRIES: 3,
   RETRY_DELAY: 2000, // 2 seconds
   ALLOWED_NETWORKS: ["base-sepolia", "base-mainnet"] as const,
