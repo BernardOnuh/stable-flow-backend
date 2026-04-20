@@ -16,7 +16,7 @@ const SECURITY_CONFIG = {
   ALLOWED_NETWORKS: ["base-sepolia", "base-mainnet","mainnet"] as const,
   RATE_LIMIT: {
     maxRequests: 10,
-    windowMs: 60000, // 1 minute
+    windowMs: 30000, // 1 minute
   },
 };
 
