@@ -11,7 +11,7 @@ if (!process.env.CDP_API_KEY || !process.env.CDP_PRIVATE_KEY) {
 // Configuration
 const CONFIG = {
   NETWORK: "base-sepolia" as const,
-  RECIPIENT_ADDRESS: "0x0000000000000000000000000000000000000000", // Change this!
+  RECIPIENT_ADDRESS: "0x75ba0000000000000000000000000000000000000", // Change this!
   VALUE: parseEther("0"),
   DATA: "0x",
   TIMEOUT_MS: 300000, // 5 minutes
