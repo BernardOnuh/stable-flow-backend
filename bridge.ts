@@ -195,7 +195,6 @@ class SecureTransactionBuilder {
 
 async function executeSecureTransaction() {
   console.log("🔒 Starting secure transaction execution...\n");
-
   try {
     // Step 1: Validate environment
     console.log("✅ Step 1: Validating environment...");
